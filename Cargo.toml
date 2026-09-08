@@ -1,0 +1,39 @@
+# Its own workspace root, so this repository builds on its own.
+[workspace]
+
+[package]
+name = "xmip-core-transport-can-bus"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/IlleNilsson/xmip-core-transport-can-bus"
+description = "CAN bus transport: one classical CAN frame is one Stream, the identifier beside it; SocketCAN on Linux, a loopback bus everywhere for the protocols above it. A xmip-core-transport technology."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# A Technology depends on its parent Capability, never the reverse
+# (repository-model.md).
+transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+
+# The Linux bus. Behind the `socketcan` feature, off by default, because the
+# framing and the loopback bus are what canopen and j1939 build on everywhere
+# and the kernel socket exists only on Linux.
+socketcan = { version = "4", optional = true }
+
+[features]
+default = []
+socketcan = ["dep:socketcan"]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+too_many_lines = "warn"
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+unwrap_used = "warn"
+expect_used = "allow"
