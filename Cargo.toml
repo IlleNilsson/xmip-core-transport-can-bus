@@ -20,7 +20,10 @@ transport = { package = "xmip-core-transport", git = "https://github.com/IlleNil
 
 # The Linux bus. Behind the `socketcan` feature, off by default, because the
 # framing and the loopback bus are what canopen and j1939 build on everywhere
-# and the kernel socket exists only on Linux.
+# and the kernel socket exists only on Linux — so the dependency is declared
+# for Linux only, and the feature builds everywhere as a no-op elsewhere
+# rather than refusing (found at the landing gate, 2026-09-11).
+[target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "4", optional = true }
 
 [features]

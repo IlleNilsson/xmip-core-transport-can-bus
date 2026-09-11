@@ -19,9 +19,11 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use transport::error::{Result, protocol_error};
-#[cfg(feature = "socketcan")]
+#[cfg(all(feature = "socketcan", target_os = "linux"))]
 use transport::error::classify;
+use transport::error::{Result, protocol_error};
+// The trait shares its name with the bus below; it is reached by path.
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT};
 use transport::{Arrived, Directions, Transport};
 
 /// One classical CAN frame.
@@ -114,13 +116,13 @@ impl Bus for Loopback {
 }
 
 /// The Linux kernel bus, `can0` and its kind.
-#[cfg(feature = "socketcan")]
+#[cfg(all(feature = "socketcan", target_os = "linux"))]
 pub struct SocketCan {
     interface: String,
     socket: socketcan::CanSocket,
 }
 
-#[cfg(feature = "socketcan")]
+#[cfg(all(feature = "socketcan", target_os = "linux"))]
 impl SocketCan {
     /// Open `interface`.
     ///
@@ -137,7 +139,7 @@ impl SocketCan {
     }
 }
 
-#[cfg(feature = "socketcan")]
+#[cfg(all(feature = "socketcan", target_os = "linux"))]
 impl Bus for SocketCan {
     fn name(&self) -> &str {
         &self.interface
@@ -184,6 +186,7 @@ impl Bus for SocketCan {
     }
 }
 
+#[derive(Clone)]
 pub struct CanTransport {
     bus: Arc<dyn Bus>,
     receive_timeout: Duration,
@@ -247,9 +250,120 @@ impl Transport for CanTransport {
     }
 }
 
+impl CanTransport {
+    /// Both ends on one in-process bus, under identifier `0x181`, the
+    /// loopback timeout standing where a kernel bus would wait for quiet.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self::new(Arc::new(Loopback::new()), 0x181).timing_out_after(LOOPBACK_TIMEOUT)
+    }
+
+    /// `can://<bus>/0x<id>`: where the near end sends.
+    fn target(&self) -> String {
+        format!("can://{}/{:#x}", self.bus.name(), self.id)
+    }
+}
+
+/// The bus the frames went on. Nothing waits: the round is in order, and
+/// the far end reads the bus until it is quiet.
+struct OnTheBus {
+    transport: CanTransport,
+    address: String,
+}
+
+impl FarEnd for OnTheBus {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        let mut origin = None;
+        let mut bytes = Vec::new();
+        while let Some(arrived) = self.transport.receive_one()? {
+            origin = Some(arrived.origin_uri);
+            bytes.extend_from_slice(&arrived.bytes);
+        }
+        let origin = origin.ok_or_else(|| protocol_error("nothing came over the bus"))?;
+        Ok(Arrived::new(origin, bytes))
+    }
+}
+
+/// A Stream longer than one frame travels as frames of at most eight bytes
+/// under one identifier, until the bus is quiet. An empty Stream is one
+/// frame with no data: CAN carries it, and the far end sees it arrive.
+impl transport::loopback::Loopback for CanTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        Ok(Box::new(OnTheBus {
+            transport: self.clone(),
+            address: self.target(),
+        }))
+    }
+
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        if payload.is_empty() {
+            return self.send(address, payload);
+        }
+        for frame in payload.chunks(8) {
+            self.send(address, frame)?;
+        }
+        Ok(())
+    }
+
+    fn unblock(&self, _address: &str) {}
+
+    /// In order on one thread: a bus does not listen, so the frames go on
+    /// first and the read-back takes them off.
+    fn round(&self, payload: &[u8]) -> Result<Arrived> {
+        let far = self.far_end()?;
+        self.send_to(far.address(), payload)?;
+        let arrived = far.take_one()?;
+        if arrived.bytes != payload {
+            return Err(protocol_error("sent, but what came off the bus differs"));
+        }
+        Ok(arrived)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::loopback::Loopback as _;
+
+    /// The shapes a protocol breaks on, as the Playground lists them.
+    fn edge_payloads() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+        ]
+    }
+
+    #[test]
+    fn a_loopback_round_carries_a_stream_as_frames() {
+        let loopback = CanTransport::loopback();
+        let arrived = loopback.round(b"seventeen bytes!!").expect("three frames");
+        assert_eq!(arrived.bytes, b"seventeen bytes!!");
+        assert_eq!(arrived.origin_uri, "can://loopback/0x181?extended=false");
+        let arrived = loopback.round(b"").expect("one empty frame");
+        assert!(arrived.bytes.is_empty());
+        assert_eq!(arrived.origin_uri, "can://loopback/0x181?extended=false");
+        assert!(loopback.ceiling().is_none());
+        assert!(loopback.refuses(b"seventeen bytes!!").is_none());
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edges_whole() {
+        let loopback = CanTransport::loopback();
+        for (name, bytes) in edge_payloads() {
+            let arrived = loopback
+                .round(&bytes)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(arrived.bytes, bytes, "{name}");
+        }
+    }
 
     #[test]
     fn a_frame_is_at_most_eight_bytes_under_a_fitting_identifier() {
