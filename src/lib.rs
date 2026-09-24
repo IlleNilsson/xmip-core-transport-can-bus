@@ -24,6 +24,7 @@ use sdk::broadcast::{Medium, Node};
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
 use transport::error::classify;
 use transport::error::{Result, protocol_error};
+use transport::held::Held;
 // The trait shares its name with the bus below; it is reached by path.
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT};
 use transport::{Arrived, Directions, Transport};
@@ -256,53 +257,38 @@ impl CanTransport {
     }
 }
 
-/// The bus the frames went on. Nothing waits: the round is in order, and
-/// the far end reads the bus until it is quiet.
-struct OnTheBus {
-    transport: CanTransport,
-    address: String,
-}
-
-impl FarEnd for OnTheBus {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    /// The first frame is waited for; the rest are already there. The
-    /// loopback's bus is simulated, and a simulated node hears a frame when
-    /// it is transmitted, so quiet after the first frame is quiet at once —
-    /// waiting the timeout for it cost every round the whole timeout.
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let first = self
-            .transport
-            .receive_one()?
-            .ok_or_else(|| protocol_error("nothing came over the bus"))?;
-        let rest = self.transport.timing_out_after(Duration::ZERO);
-        let mut bytes = first.bytes;
-        while let Some(arrived) = rest.receive_one()? {
-            bytes.extend_from_slice(&arrived.bytes);
-        }
-        Ok(Arrived::new(first.origin_uri, bytes))
-    }
-}
-
 /// A Stream longer than one frame travels as frames of at most eight bytes
 /// under one identifier, until the bus is quiet. An empty Stream is one
 /// frame with no data: CAN carries it, and the far end sees it arrive.
 impl transport::loopback::Loopback for CanTransport {
+    /// The bus the frames went on. Nothing waits: the round is in order, and
+    /// the far end reads the bus until it is quiet.
+    ///
+    /// The first frame is waited for; the rest are already there. The
+    /// loopback's bus is simulated, and a simulated node hears a frame when
+    /// it is transmitted, so quiet after the first frame is quiet at once —
+    /// waiting the timeout for it cost every round the whole timeout.
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let far = self
             .far
             .clone()
             .ok_or_else(|| protocol_error("a bus with no far end: not a loopback"))?;
-        Ok(Box::new(OnTheBus {
-            transport: Self {
-                bus: far,
-                far: None,
-                ..self.clone()
-            },
-            address: self.target(),
-        }))
+        let transport = Self {
+            bus: far,
+            far: None,
+            ..self.clone()
+        };
+        Ok(Box::new(Held::new(self.target(), move || {
+            let first = transport
+                .receive_one()?
+                .ok_or_else(|| protocol_error("nothing came over the bus"))?;
+            let rest = transport.timing_out_after(Duration::ZERO);
+            let mut bytes = first.bytes;
+            while let Some(arrived) = rest.receive_one()? {
+                bytes.extend_from_slice(&arrived.bytes);
+            }
+            Ok(Arrived::new(first.origin_uri, bytes))
+        })))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
