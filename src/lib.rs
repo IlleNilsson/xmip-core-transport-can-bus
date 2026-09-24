@@ -10,14 +10,16 @@
 //! origin URI, `can://can0/0x181?extended=false`, and the protocols above it
 //! read it back from there. Which frames belong together is theirs.
 //!
-//! Two buses. [`Bus`] is the boundary; [`Loopback`] is an in-process bus that
-//! every test and every box without a CAN interface can drive; `socketcan`,
-//! behind the feature of that name, is the Linux kernel bus. A transport is
-//! built on whichever bus the node has.
+//! Two buses. [`Bus`] is the boundary. A node on the SDK's broadcast medium
+//! is one — every test and every box without a CAN interface drives it, and
+//! every other node on it hears a frame as on a real bus; `socketcan`, behind
+//! the feature of that name, is the Linux kernel bus. A transport is built on
+//! whichever bus the node has.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
+
+use sdk::broadcast::{Medium, Node};
 
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
 use transport::error::classify;
@@ -80,38 +82,21 @@ pub trait Bus: Send + Sync {
     fn transmit(&self, frame: &Frame) -> Result<()>;
 }
 
-/// An in-process bus: what is transmitted is received, in order.
-#[derive(Clone, Default)]
-pub struct Loopback {
-    frames: Arc<Mutex<VecDeque<Frame>>>,
-}
-
-impl Loopback {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
-    }
-}
-
-impl Bus for Loopback {
-    fn name(&self) -> &'static str {
-        "loopback"
+/// A node on the SDK's broadcast medium is a bus: it hears what the other
+/// nodes transmit, never its own frames, and a frame nobody else is there to
+/// hear is not acknowledged. It replaced this crate's own in-process bus on
+/// 2026-09-24, a single queue a node read its own frames back from.
+impl Bus for Node<Frame> {
+    fn name(&self) -> &str {
+        Node::name(self)
     }
 
-    fn receive(&self, _timeout: Duration) -> Result<Option<Frame>> {
-        Ok(self
-            .frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop_front())
+    fn receive(&self, timeout: Duration) -> Result<Option<Frame>> {
+        Node::receive(self, timeout)
     }
 
     fn transmit(&self, frame: &Frame) -> Result<()> {
-        self.frames
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push_back(frame.clone());
-        Ok(())
+        Node::transmit(self, frame)
     }
 }
 
@@ -192,6 +177,8 @@ pub struct CanTransport {
     receive_timeout: Duration,
     id: u32,
     extended: bool,
+    /// On a loopback, the far end's node on the same medium.
+    far: Option<Arc<dyn Bus>>,
 }
 
 impl CanTransport {
@@ -203,6 +190,7 @@ impl CanTransport {
             receive_timeout: Duration::from_secs(1),
             id,
             extended: id > 0x7ff,
+            far: None,
         }
     }
 
@@ -251,11 +239,15 @@ impl Transport for CanTransport {
 }
 
 impl CanTransport {
-    /// Both ends on one in-process bus, under identifier `0x181`, the
-    /// loopback timeout standing where a kernel bus would wait for quiet.
+    /// Both ends on one simulated bus: this node sending under identifier
+    /// `0x181`, a second node on the same medium its far end, the loopback
+    /// timeout standing where a kernel bus would wait for quiet.
     #[must_use]
     pub fn loopback() -> Self {
-        Self::new(Arc::new(Loopback::new()), 0x181).timing_out_after(LOOPBACK_TIMEOUT)
+        let medium = Medium::new("loopback");
+        let mut near = Self::new(Arc::new(medium.node()), 0x181).timing_out_after(LOOPBACK_TIMEOUT);
+        near.far = Some(Arc::new(medium.node()));
+        near
     }
 
     /// `can://<bus>/0x<id>`: where the near end sends.
@@ -276,15 +268,21 @@ impl FarEnd for OnTheBus {
         &self.address
     }
 
+    /// The first frame is waited for; the rest are already there. The
+    /// loopback's bus is simulated, and a simulated node hears a frame when
+    /// it is transmitted, so quiet after the first frame is quiet at once —
+    /// waiting the timeout for it cost every round the whole timeout.
     fn take_one(self: Box<Self>) -> Result<Arrived> {
-        let mut origin = None;
-        let mut bytes = Vec::new();
-        while let Some(arrived) = self.transport.receive_one()? {
-            origin = Some(arrived.origin_uri);
+        let first = self
+            .transport
+            .receive_one()?
+            .ok_or_else(|| protocol_error("nothing came over the bus"))?;
+        let rest = self.transport.timing_out_after(Duration::ZERO);
+        let mut bytes = first.bytes;
+        while let Some(arrived) = rest.receive_one()? {
             bytes.extend_from_slice(&arrived.bytes);
         }
-        let origin = origin.ok_or_else(|| protocol_error("nothing came over the bus"))?;
-        Ok(Arrived::new(origin, bytes))
+        Ok(Arrived::new(first.origin_uri, bytes))
     }
 }
 
@@ -293,8 +291,16 @@ impl FarEnd for OnTheBus {
 /// frame with no data: CAN carries it, and the far end sees it arrive.
 impl transport::loopback::Loopback for CanTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let far = self
+            .far
+            .clone()
+            .ok_or_else(|| protocol_error("a bus with no far end: not a loopback"))?;
         Ok(Box::new(OnTheBus {
-            transport: self.clone(),
+            transport: Self {
+                bus: far,
+                far: None,
+                ..self.clone()
+            },
             address: self.target(),
         }))
     }
@@ -361,13 +367,15 @@ mod tests {
     }
 
     #[test]
-    fn the_loopback_bus_carries_frames_in_order_and_the_transport_reads_them() {
-        let bus: Arc<dyn Bus> = Arc::new(Loopback::new());
-        let transport = CanTransport::new(Arc::clone(&bus), 0x181);
-        transport
+    fn another_node_reads_the_frames_in_order_and_the_sender_does_not() {
+        let medium = Medium::new("loopback");
+        let quiet = Duration::from_millis(10);
+        let sender = CanTransport::new(Arc::new(medium.node()), 0x181).timing_out_after(quiet);
+        let transport = CanTransport::new(Arc::new(medium.node()), 0x181).timing_out_after(quiet);
+        sender
             .send("can://loopback/0x181", &[0xaa])
             .expect("sending");
-        transport
+        sender
             .send("can://loopback/0x18fef100", &[0xbb, 0xcc])
             .expect("sending extended");
         let first = transport
@@ -385,12 +393,21 @@ mod tests {
             transport.receive().expect("quiet").is_empty(),
             "nothing is not an error"
         );
-        assert!(transport.send("can://loopback/0xzz", &[]).is_err());
+        assert!(sender.receive().expect("quiet").is_empty(), "not its own");
+        assert!(sender.send("can://loopback/0xzz", &[]).is_err());
+    }
+
+    #[test]
+    fn a_frame_no_other_node_hears_is_not_acknowledged() {
+        let alone = CanTransport::new(Arc::new(Medium::<Frame>::new("can0").node()), 0x181);
+        let refused = alone.send("can://can0/0x181", &[1]).expect_err("nobody");
+        assert!(refused.retryable, "{refused}");
+        assert!(alone.far_end().is_err(), "not a loopback");
     }
 
     #[test]
     fn a_bus_has_no_artefact_to_claim() {
-        let transport = CanTransport::new(Arc::new(Loopback::new()), 0x181);
+        let transport = CanTransport::new(Arc::new(Medium::<Frame>::new("can0").node()), 0x181);
         assert!(transport.claims().is_none());
         assert_eq!(transport.name(), "can-bus");
     }
