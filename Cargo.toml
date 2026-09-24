@@ -17,6 +17,9 @@ path = "src/lib.rs"
 # A Technology depends on its parent Capability, never the reverse
 # (repository-model.md).
 transport = { package = "xmip-core-transport", git = "https://github.com/IlleNilsson/xmip-core-transport", branch = "main" }
+# The simulated bus a test or a box without an interface drives: a node on the
+# SDK's broadcast medium (ADR-0061, simulators in the SDK).
+sdk = { package = "xmip-core-sdk", git = "https://github.com/IlleNilsson/xmip-core-sdk", branch = "main" }
 
 # The Linux bus. Behind the `socketcan` feature, off by default, because the
 # framing and the loopback bus are what canopen and j1939 build on everywhere
