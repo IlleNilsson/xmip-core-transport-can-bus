@@ -16,10 +16,12 @@
 //! the feature of that name, is the Linux kernel bus. A transport is built on
 //! whichever bus the node has.
 
+pub mod loopback;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use sdk::broadcast::{Medium, Node};
+use sdk::broadcast::Node;
 
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
 use transport::error::classify;
@@ -245,9 +247,9 @@ impl CanTransport {
     /// timeout standing where a kernel bus would wait for quiet.
     #[must_use]
     pub fn loopback() -> Self {
-        let medium = Medium::new("loopback");
-        let mut near = Self::new(Arc::new(medium.node()), 0x181).timing_out_after(LOOPBACK_TIMEOUT);
-        near.far = Some(Arc::new(medium.node()));
+        let session = loopback::Session::fresh();
+        let mut near = Self::new(session.near, 0x181).timing_out_after(LOOPBACK_TIMEOUT);
+        near.far = Some(session.far);
         near
     }
 
@@ -301,18 +303,17 @@ impl transport::loopback::Loopback for CanTransport {
         Ok(())
     }
 
-    fn unblock(&self, _address: &str) {}
-
     /// In order on one thread: a bus does not listen, so the frames go on
     /// first and the read-back takes them off.
-    fn round(&self, payload: &[u8]) -> Result<Arrived> {
-        self.round_in_order(payload)
+    fn exchanges_in_order(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdk::broadcast::Medium;
     use transport::loopback::Loopback as _;
     use transport::payload::edge_payloads;
 
@@ -354,10 +355,10 @@ mod tests {
 
     #[test]
     fn another_node_reads_the_frames_in_order_and_the_sender_does_not() {
-        let medium = Medium::new("loopback");
+        let session = loopback::Session::fresh();
         let quiet = Duration::from_millis(10);
-        let sender = CanTransport::new(Arc::new(medium.node()), 0x181).timing_out_after(quiet);
-        let transport = CanTransport::new(Arc::new(medium.node()), 0x181).timing_out_after(quiet);
+        let sender = CanTransport::new(session.near, 0x181).timing_out_after(quiet);
+        let transport = CanTransport::new(session.far, 0x181).timing_out_after(quiet);
         sender
             .send("can://loopback/0x181", &[0xaa])
             .expect("sending");
