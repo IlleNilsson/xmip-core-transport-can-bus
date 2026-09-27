@@ -29,7 +29,11 @@ use transport::error::{Result, protocol_error};
 use transport::held::Held;
 // The trait shares its name with the bus below; it is reached by path.
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT};
-use transport::{Arrived, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// How long a receive waits for a frame when a Location says nothing else.
+pub const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// One classical CAN frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +178,21 @@ impl Bus for SocketCan {
     }
 }
 
+/// The bus a Location's address names: the kernel interface, `can0`, where
+/// the build has `socketcan` on Linux; a node on a simulated bus of that name
+/// otherwise. The one way from an address to a bus, for every technology
+/// riding on CAN.
+///
+/// # Errors
+/// An interface the kernel will not open.
+pub fn open_bus(address: &str) -> Result<Arc<dyn Bus>> {
+    #[cfg(all(feature = "socketcan", target_os = "linux"))]
+    let bus: Arc<dyn Bus> = Arc::new(SocketCan::open(address)?);
+    #[cfg(not(all(feature = "socketcan", target_os = "linux")))]
+    let bus: Arc<dyn Bus> = Arc::new(sdk::broadcast::Medium::<Frame>::new(address).node());
+    Ok(bus)
+}
+
 #[derive(Clone)]
 pub struct CanTransport {
     bus: Arc<dyn Bus>,
@@ -190,7 +209,7 @@ impl CanTransport {
     pub fn new(bus: Arc<dyn Bus>, id: u32) -> Self {
         Self {
             bus,
-            receive_timeout: Duration::from_secs(1),
+            receive_timeout: RECEIVE_TIMEOUT,
             id,
             extended: id > 0x7ff,
             far: None,
@@ -238,6 +257,44 @@ impl Transport for CanTransport {
         };
         let extended = self.extended || id > 0x7ff;
         self.bus.transmit(&Frame::new(id, extended, bytes)?)
+    }
+}
+
+impl Configured for CanTransport {
+    /// The address is the bus, as [`open_bus`] opens it.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "id",
+                kind: Kind::Integer {
+                    minimum: 0,
+                    maximum: 0x1fff_ffff,
+                },
+                presence: Presence::Required,
+                meaning: "The identifier a frame is sent under where the target names none; \
+                          one over 0x7ff is extended.",
+                applies: Applies::Send,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Default(Fixed::Duration(RECEIVE_TIMEOUT)),
+                meaning: "How long a receive waits for a frame before it finds none.",
+                applies: Applies::Receive,
+            },
+        ],
+    };
+
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        // A Receive Location reads no identifier: it hears every frame.
+        let id = settings.optional_integer("id").unwrap_or_default();
+        let id = u32::try_from(id).map_err(|_| protocol_error("an identifier over 29 bits"))?;
+        let transport = Self::new(open_bus(address)?, id);
+        Ok(match settings.optional_duration("timeout") {
+            Some(timeout) => transport.timing_out_after(timeout),
+            None => transport,
+        })
     }
 }
 
@@ -316,6 +373,26 @@ mod tests {
     use sdk::broadcast::Medium;
     use transport::loopback::Loopback as _;
     use transport::payload::edge_payloads;
+    use xcore::settings::Given;
+
+    /// On the simulated bus: with `socketcan` on Linux the address opens a
+    /// kernel socket, which a unit test does not.
+    #[test]
+    #[cfg(not(all(feature = "socketcan", target_os = "linux")))]
+    fn can_bus_declares_its_settings_and_reads_through_them() {
+        assert_eq!(CanTransport::SETTINGS.problems(), Vec::<String>::new());
+        let given = [("id".to_string(), Given::Integer(0x18fe_f100))];
+        let sending = CanTransport::open("vcan0", Applies::Send, &given).expect("send");
+        assert_eq!(sending.id, 0x18fe_f100);
+        assert!(sending.extended);
+        let given = [("timeout".to_string(), Given::Text("50ms".to_string()))];
+        let receiving = CanTransport::open("vcan0", Applies::Receive, &given).expect("receive");
+        assert_eq!(receiving.receive_timeout, Duration::from_millis(50));
+        let Err(refused) = CanTransport::open("vcan0", Applies::Send, &[]) else {
+            panic!("id is required on a Send Location");
+        };
+        assert!(refused.message.contains("\"id\""), "{}", refused.message);
+    }
 
     #[test]
     fn a_loopback_round_carries_a_stream_as_frames() {
