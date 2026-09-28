@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use sdk::broadcast::Node;
 
+use codec::hex::prefixed_number;
+use net::Target;
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
 use transport::error::classify;
 use transport::error::{Result, protocol_error};
@@ -33,7 +35,7 @@ use transport::{Arrived, Configured, Directions, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
 
 /// How long a receive waits for a frame when a Location says nothing else.
-pub const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
+const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// One classical CAN frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,8 +252,9 @@ impl Transport for CanTransport {
 
     /// `target` may name an identifier, `0x181`, overriding the transport's.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
-        let id = match target.trim_start_matches("can://").rsplit('/').next() {
-            Some(hex) if hex.starts_with("0x") => u32::from_str_radix(&hex[2..], 16)
+        let named = Target::under(&["can"], target).map_or(target, |named| named.path());
+        let id = match named.rsplit('/').next() {
+            Some(hex) if hex.starts_with("0x") => prefixed_number(hex)
                 .map_err(|_| protocol_error(format!("{hex} is not a CAN identifier")))?,
             _ => self.id,
         };
