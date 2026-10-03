@@ -14,25 +14,36 @@
 //! is one — every test and every box without a CAN interface drives it, and
 //! every other node on it hears a frame as on a real bus; `socketcan`, behind
 //! the feature of that name, is the Linux kernel bus. A transport is built on
-//! whichever bus the node has.
+//! whichever bus the node has; both live in `bus.rs`.
+//!
+//! **Acceptance is at-most-once here** ([`AT_MOST_ONCE`]): a CAN frame is
+//! acknowledged in its ACK slot by every controller that hears it, before
+//! any receiver reads it, and has no reply above that. Each frame arrives
+//! whole. The protocols above that have one — ISO-TP's flow control, a
+//! `CANopen` SDO response — answer it themselves.
 
+mod bus;
 pub mod loopback;
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use sdk::broadcast::Node;
-
+#[cfg(all(feature = "socketcan", target_os = "linux"))]
+pub use bus::SocketCan;
+pub use bus::{Bus, open_bus};
 use codec::hex::prefixed_number;
 use net::Target;
-#[cfg(all(feature = "socketcan", target_os = "linux"))]
-use transport::error::classify;
 use transport::error::{Result, protocol_error};
 use transport::held::Held;
 // The trait shares its name with the bus below; it is reached by path.
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT};
-use transport::{Arrived, Configured, Directions, Transport};
+use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport};
 use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+
+/// Why a CAN frame cannot be acknowledged after the receive cycle.
+pub const AT_MOST_ONCE: &str = "a CAN frame is acknowledged on the wire by every controller \
+                                that hears it, before any receiver reads it; there is no \
+                                reply to defer";
 
 /// How long a receive waits for a frame when a Location says nothing else.
 const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -75,126 +86,6 @@ impl Frame {
     }
 }
 
-/// Where frames go and come from.
-pub trait Bus: Send + Sync {
-    /// The bus's name, for the origin URI.
-    fn name(&self) -> &str;
-    /// The next frame, or `None` when nothing arrived within `timeout`.
-    ///
-    /// # Errors
-    /// Where the bus could not be read.
-    fn receive(&self, timeout: Duration) -> Result<Option<Frame>>;
-    /// Put a frame on the bus.
-    ///
-    /// # Errors
-    /// Where the bus refused it.
-    fn transmit(&self, frame: &Frame) -> Result<()>;
-}
-
-/// A node on the SDK's broadcast medium is a bus: it hears what the other
-/// nodes transmit, never its own frames, and a frame nobody else is there to
-/// hear is not acknowledged. It replaced this crate's own in-process bus on
-/// 2026-09-24, a single queue a node read its own frames back from.
-impl Bus for Node<Frame> {
-    fn name(&self) -> &str {
-        Node::name(self)
-    }
-
-    fn receive(&self, timeout: Duration) -> Result<Option<Frame>> {
-        Node::receive(self, timeout)
-    }
-
-    fn transmit(&self, frame: &Frame) -> Result<()> {
-        Node::transmit(self, frame)
-    }
-}
-
-/// The Linux kernel bus, `can0` and its kind.
-#[cfg(all(feature = "socketcan", target_os = "linux"))]
-pub struct SocketCan {
-    interface: String,
-    socket: socketcan::CanSocket,
-}
-
-#[cfg(all(feature = "socketcan", target_os = "linux"))]
-impl SocketCan {
-    /// Open `interface`.
-    ///
-    /// # Errors
-    /// Where the interface does not exist or cannot be opened.
-    pub fn open(interface: &str) -> Result<Self> {
-        use socketcan::Socket;
-        let socket = socketcan::CanSocket::open(interface)
-            .map_err(|e| classify("opening the CAN interface", &std::io::Error::other(e)))?;
-        Ok(Self {
-            interface: interface.to_string(),
-            socket,
-        })
-    }
-}
-
-#[cfg(all(feature = "socketcan", target_os = "linux"))]
-impl Bus for SocketCan {
-    fn name(&self) -> &str {
-        &self.interface
-    }
-
-    fn receive(&self, timeout: Duration) -> Result<Option<Frame>> {
-        use socketcan::{EmbeddedFrame, Socket};
-        self.socket
-            .set_read_timeout(timeout)
-            .map_err(|e| classify("setting the read timeout", &e))?;
-        match self.socket.read_frame() {
-            Ok(socketcan::CanFrame::Data(frame)) => Ok(Some(Frame {
-                id: match frame.id() {
-                    socketcan::Id::Standard(id) => u32::from(id.as_raw()),
-                    socketcan::Id::Extended(id) => id.as_raw(),
-                },
-                extended: frame.is_extended(),
-                data: frame.data().to_vec(),
-            })),
-            Ok(_) => Ok(None),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-            Err(e) => Err(classify("reading the bus", &e)),
-        }
-    }
-
-    fn transmit(&self, frame: &Frame) -> Result<()> {
-        use socketcan::{EmbeddedFrame, Socket};
-        let id = if frame.extended {
-            socketcan::Id::Extended(
-                socketcan::ExtendedId::new(frame.id)
-                    .ok_or_else(|| protocol_error("an identifier wider than 29 bits"))?,
-            )
-        } else {
-            socketcan::Id::Standard(
-                socketcan::StandardId::new(u16::try_from(frame.id).unwrap_or(u16::MAX))
-                    .ok_or_else(|| protocol_error("an identifier wider than 11 bits"))?,
-            )
-        };
-        let can = socketcan::CanFrame::new(id, &frame.data)
-            .ok_or_else(|| protocol_error("a frame the bus refused"))?;
-        self.socket
-            .write_frame(&can)
-            .map_err(|e| classify("writing the bus", &e))
-    }
-}
-
-/// The bus a Location's address names: the kernel interface, `can0`, where
-/// the build has `socketcan` on Linux; a node on a simulated bus of that name
-/// otherwise. The one way from an address to a bus, for every technology
-/// riding on CAN.
-///
-/// # Errors
-/// An interface the kernel will not open.
-pub fn open_bus(address: &str) -> Result<Arc<dyn Bus>> {
-    #[cfg(all(feature = "socketcan", target_os = "linux"))]
-    let bus: Arc<dyn Bus> = Arc::new(SocketCan::open(address)?);
-    #[cfg(not(all(feature = "socketcan", target_os = "linux")))]
-    let bus: Arc<dyn Bus> = Arc::new(sdk::broadcast::Medium::<Frame>::new(address).node());
-    Ok(bus)
-}
-
 #[derive(Clone)]
 pub struct CanTransport {
     bus: Arc<dyn Bus>,
@@ -224,15 +115,27 @@ impl CanTransport {
         self
     }
 
-    /// The next frame on the bus as a Stream, or `None` when the bus is quiet.
+    /// The next frame on the bus as a Stream, whole, or `None` when the bus
+    /// is quiet. Acceptance is at-most-once ([`AT_MOST_ONCE`]).
     ///
     /// # Errors
     /// Where the bus could not be read.
     pub fn receive_one(&self) -> Result<Option<Arrived>> {
-        Ok(self
-            .bus
-            .receive(self.receive_timeout)?
-            .map(|frame| Arrived::new(frame.origin(self.bus.name()), frame.data)))
+        Ok(self.receive_frame()?.map(|frame| {
+            Arrived::whole(
+                frame.origin(self.bus.name()),
+                frame.data,
+                Acknowledgement::at_most_once(AT_MOST_ONCE),
+            )
+        }))
+    }
+
+    /// The next frame on the bus, or `None` when the bus is quiet.
+    ///
+    /// # Errors
+    /// Where the bus could not be read.
+    pub fn receive_frame(&self) -> Result<Option<Frame>> {
+        self.bus.receive(self.receive_timeout)
     }
 }
 
@@ -245,7 +148,12 @@ impl Transport for CanTransport {
         Directions::BOTH
     }
 
-    /// Nothing on the bus is not an error: an empty vector.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("one line or bus, answered in the order it speaks")
+    }
+
+    /// Nothing on the bus is not an error: an empty vector. Acceptance is
+    /// at-most-once here: a frame has no reply to defer ([`AT_MOST_ONCE`]).
     fn receive(&self) -> Result<Vec<Arrived>> {
         Ok(self.receive_one()?.into_iter().collect())
     }
@@ -340,16 +248,18 @@ impl transport::loopback::Loopback for CanTransport {
             far: None,
             ..self.clone()
         };
+        let name = transport.bus.name().to_string();
         Ok(Box::new(Held::new(self.target(), move || {
             let first = transport
-                .receive_one()?
+                .receive_frame()?
                 .ok_or_else(|| protocol_error("nothing came over the bus"))?;
             let rest = transport.timing_out_after(Duration::ZERO);
-            let mut bytes = first.bytes;
-            while let Some(arrived) = rest.receive_one()? {
-                bytes.extend_from_slice(&arrived.bytes);
+            let origin = first.origin(&name);
+            let mut bytes = first.data;
+            while let Some(frame) = rest.receive_frame()? {
+                bytes.extend_from_slice(&frame.data);
             }
-            Ok(Arrived::new(first.origin_uri, bytes))
+            Ok(Taken::new(origin, bytes))
         })))
     }
 
@@ -449,6 +359,8 @@ mod tests {
             .receive_one()
             .expect("receiving")
             .expect("a frame");
+        assert!(!first.defers(), "a CAN frame is at-most-once");
+        let first = first.taken().expect("taken");
         assert_eq!(first.bytes, [0xaa]);
         assert_eq!(first.origin_uri, "can://loopback/0x181?extended=false");
         let second = transport
