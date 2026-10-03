@@ -6,6 +6,14 @@ A send target is read by `net::Target` in [xmip-core-library-net](https://github
 
 A `0x` number in a target is read by `codec::hex::prefixed_number` in [xmip-core-library-codec](https://github.com/IlleNilsson/xmip-core-library-codec), which refuses a sign; until 2026-09-28 it was read with `from_str_radix`, which took `0x+7e8`.
 
+## Acknowledgement
+
+Acceptance is at-most-once here. A CAN frame is acknowledged in its ACK slot
+by every controller that hears it, before any receiver reads it, and has no
+reply above that: nobody is left to tell how the receive cycle ended. Each
+frame arrives whole. The protocols above that have a reply, ISO-TP's flow
+control or a CANopen SDO response, answer it themselves.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
