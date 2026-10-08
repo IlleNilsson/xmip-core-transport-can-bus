@@ -32,6 +32,7 @@ use std::time::Duration;
 pub use bus::SocketCan;
 pub use bus::{Bus, open_bus};
 use codec::hex::prefixed_number;
+use context::property::CAN_IDENTIFIER;
 use net::Target;
 use transport::error::{Result, protocol_error};
 use transport::held::Held;
@@ -127,6 +128,7 @@ impl CanTransport {
                 frame.data,
                 Acknowledgement::at_most_once(AT_MOST_ONCE),
             )
+            .observing(CAN_IDENTIFIER, format!("{:#x}", frame.id))
         }))
     }
 
@@ -231,6 +233,10 @@ impl CanTransport {
 /// under one identifier, until the bus is quiet. An empty Stream is one
 /// frame with no data: CAN carries it, and the far end sees it arrive.
 impl transport::loopback::Loopback for CanTransport {
+    fn arrival_identity(&self) -> transport::ArrivalIdentity {
+        transport::ArrivalIdentity::Named(&[context::property::CAN_IDENTIFIER])
+    }
+
     /// The bus the frames went on. Nothing waits: the round is in order, and
     /// the far end reads the bus until it is quiet.
     ///
@@ -255,11 +261,12 @@ impl transport::loopback::Loopback for CanTransport {
                 .ok_or_else(|| protocol_error("nothing came over the bus"))?;
             let rest = transport.timing_out_after(Duration::ZERO);
             let origin = first.origin(&name);
+            let identifier = format!("{:#x}", first.id);
             let mut bytes = first.data;
             while let Some(frame) = rest.receive_frame()? {
                 bytes.extend_from_slice(&frame.data);
             }
-            Ok(Taken::new(origin, bytes))
+            Ok(Taken::new(origin, bytes).observing(CAN_IDENTIFIER, identifier))
         })))
     }
 
