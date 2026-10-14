@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(arrived.bytes, b"seventeen bytes!!");
         assert_eq!(arrived.origin_uri, "can://loopback/0x181?extended=false");
         let arrived = loopback.round(b"").expect("one empty frame");
-        assert!(arrived.bytes.is_empty());
+        assert_eq!(arrived.bytes, [] as [u8; 0]);
         assert_eq!(arrived.origin_uri, "can://loopback/0x181?extended=false");
         assert!(loopback.ceiling().is_none());
         assert!(loopback.refuses(b"seventeen bytes!!").is_none());
