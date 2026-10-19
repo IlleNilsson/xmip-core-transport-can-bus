@@ -160,12 +160,17 @@ impl Transport for CanTransport {
 
     /// Nothing on the bus is not an error: an empty vector. Acceptance is
     /// at-most-once here: a frame has no reply to defer ([`AT_MOST_ONCE`]).
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, _most: usize) -> Result<Vec<Arrived>> {
         Ok(self.receive_one()?.into_iter().collect())
     }
 
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("one CAN frame carries the whole body")
+    }
+
     /// `target` may name an identifier, `0x181`, overriding the transport's.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
         let named = Target::under(&["can"], target).map_or(target, |named| named.path());
         let id = match named.rsplit('/').next() {
             Some(hex) if hex.starts_with("0x") => prefixed_number(hex)
