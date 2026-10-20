@@ -401,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bus_has_no_artefact_to_claim() {
+    fn a_bus_has_no_artifact_to_claim() {
         let transport = CanTransport::new(Arc::new(Medium::<Frame>::new("can0").node()), 0x181);
         assert!(transport.claims().is_none());
         assert_eq!(transport.name(), "can-bus");
