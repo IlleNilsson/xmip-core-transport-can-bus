@@ -171,7 +171,7 @@ impl Transport for CanTransport {
     /// `target` may name an identifier, `0x181`, overriding the transport's.
     fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
         let bytes: &[u8] = &outgoing.gather()?;
-        let named = Target::under(&["can"], target).map_or(target, |named| named.path());
+        let named = Target::under(Self::SCHEMES, target).map_or(target, |named| named.path());
         let id = match named.rsplit('/').next() {
             Some(hex) if hex.starts_with("0x") => prefixed_number(hex)
                 .map_err(|_| protocol_error(format!("{hex} is not a CAN identifier")))?,
@@ -207,6 +207,9 @@ impl Configured for CanTransport {
             },
         ],
     };
+
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["can"];
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         // A Receive Location reads no identifier: it hears every frame.
