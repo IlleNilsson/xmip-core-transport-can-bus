@@ -130,9 +130,9 @@ impl Bus for SocketCan {
 /// # Errors
 /// An interface the kernel will not open.
 pub fn open_bus(address: &str) -> Result<Arc<dyn Bus>> {
-    #[cfg(all(feature = "socketcan", target_os = "linux"))]
-    let bus: Arc<dyn Bus> = Arc::new(SocketCan::open(address)?);
-    #[cfg(not(all(feature = "socketcan", target_os = "linux")))]
-    let bus: Arc<dyn Bus> = Arc::new(sdk::broadcast::Medium::<Frame>::new(address).node());
+    let bus: Arc<dyn Bus> = cfg_select! {
+        all(feature = "socketcan", target_os = "linux") => Arc::new(SocketCan::open(address)?),
+        _ => Arc::new(sdk::broadcast::Medium::<Frame>::new(address).node()),
+    };
     Ok(bus)
 }
