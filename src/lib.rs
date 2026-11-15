@@ -39,7 +39,7 @@ use transport::held::Held;
 // The trait shares its name with the bus below; it is reached by path.
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT};
 use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport};
-use xcore::settings::{Applies, Fixed, Kind, Presence, Read, Setting, Settings};
+use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 /// Why a CAN frame cannot be acknowledged after the receive cycle.
 pub const AT_MOST_ONCE: &str = "a CAN frame is acknowledged on the wire by every controller \
@@ -108,12 +108,6 @@ impl CanTransport {
             extended: id > 0x7ff,
             far: None,
         }
-    }
-
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.receive_timeout = timeout;
-        self
     }
 
     /// The next frame on the bus as a Stream, whole, or `None` when the bus
@@ -198,28 +192,26 @@ impl Configured for CanTransport {
                           one over 0x7ff is extended.",
                 applies: Applies::Send,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Default(Fixed::Duration(RECEIVE_TIMEOUT)),
-                meaning: "How long a receive waits for a frame before it finds none.",
-                applies: Applies::Receive,
-            },
+            transport::configured::timeout(
+                Applies::Receive,
+                Some(RECEIVE_TIMEOUT),
+                "How long a receive waits for a frame before it finds none.",
+            ),
         ],
     };
 
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["can"];
 
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.receive_timeout)
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         // A Receive Location reads no identifier: it hears every frame.
         let id = settings.optional_integer("id").unwrap_or_default();
         let id = u32::try_from(id).map_err(|_| protocol_error("an identifier over 29 bits"))?;
-        let transport = Self::new(open_bus(address)?, id);
-        Ok(match settings.optional_duration("timeout") {
-            Some(timeout) => transport.timing_out_after(timeout),
-            None => transport,
-        })
+        Ok(Self::new(open_bus(address)?, id))
     }
 }
 
@@ -305,13 +297,13 @@ mod tests {
     use sdk::broadcast::Medium;
     use transport::loopback::Loopback as _;
     use transport::payload::edge_payloads;
-    use xcore::settings::Given;
 
     /// On the simulated bus: with `socketcan` on Linux the address opens a
     /// kernel socket, which a unit test does not.
     #[test]
     #[cfg(not(all(feature = "socketcan", target_os = "linux")))]
     fn can_bus_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
         assert_eq!(CanTransport::SETTINGS.problems(), Vec::<String>::new());
         let given = [("id".to_string(), Given::Integer(0x18fe_f100))];
         let sending = CanTransport::open("vcan0", Applies::Send, &given).expect("send");
