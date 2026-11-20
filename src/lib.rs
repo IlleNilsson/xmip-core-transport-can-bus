@@ -30,7 +30,7 @@ use std::time::Duration;
 
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
 pub use bus::SocketCan;
-pub use bus::{Bus, open_bus};
+pub use bus::{Bus, open_bus, simulated};
 use codec::hex::prefixed_number;
 use context::property::CAN_IDENTIFIER;
 use net::Target;
@@ -208,14 +208,23 @@ impl Configured for CanTransport {
     }
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
-        // A Receive Location reads no identifier: it hears every frame.
-        let id = settings.optional_integer("id").unwrap_or_default();
-        let id = u32::try_from(id).map_err(|_| protocol_error("an identifier over 29 bits"))?;
-        Ok(Self::new(open_bus(address)?, id))
+        Self::on(open_bus(address)?, settings)
     }
 }
 
 impl CanTransport {
+    /// The node a Location's settings build on `bus`: the bus its address
+    /// names, or a simulated one a test gives it.
+    ///
+    /// # Errors
+    /// An identifier over 29 bits.
+    pub(crate) fn on(bus: Arc<dyn Bus>, settings: &Read) -> Result<Self> {
+        // A Receive Location reads no identifier: it hears every frame.
+        let id = settings.optional_integer("id").unwrap_or_default();
+        let id = u32::try_from(id).map_err(|_| protocol_error("an identifier over 29 bits"))?;
+        Ok(Self::new(bus, id))
+    }
+
     /// Both ends on one simulated bus: this node sending under identifier
     /// `0x181`, a second node on the same medium its far end, the loopback
     /// timeout standing where a kernel bus would wait for quiet.
@@ -294,23 +303,28 @@ impl transport::loopback::Loopback for CanTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sdk::broadcast::Medium;
     use transport::loopback::Loopback as _;
     use transport::payload::edge_payloads;
 
-    /// On the simulated bus: with `socketcan` on Linux the address opens a
-    /// kernel socket, which a unit test does not.
+    /// On the simulated bus, by its own constructor, wherever it runs: with
+    /// `socketcan` on Linux the address opens a kernel socket, which a unit
+    /// test does not, and in the estate's one workspace another crate turns
+    /// that feature on.
     #[test]
-    #[cfg(not(all(feature = "socketcan", target_os = "linux")))]
     fn can_bus_declares_its_settings_and_reads_through_them() {
         use xcore::settings::Given;
+        let on = |side, given: &[(String, Given)]| {
+            let read = CanTransport::SETTINGS.read(side, given).expect("read");
+            let built = CanTransport::on(simulated("vcan0"), &read).expect("built");
+            built.finished(&read, side)
+        };
         assert_eq!(CanTransport::SETTINGS.problems(), Vec::<String>::new());
         let given = [("id".to_string(), Given::Integer(0x18fe_f100))];
-        let sending = CanTransport::open("vcan0", Applies::Send, &given).expect("send");
+        let sending = on(Applies::Send, &given);
         assert_eq!(sending.id, 0x18fe_f100);
         assert!(sending.extended);
         let given = [("timeout".to_string(), Given::Text("50ms".to_string()))];
-        let receiving = CanTransport::open("vcan0", Applies::Receive, &given).expect("receive");
+        let receiving = on(Applies::Receive, &given);
         assert_eq!(receiving.receive_timeout, Duration::from_millis(50));
         let Err(refused) = CanTransport::open("vcan0", Applies::Send, &[]) else {
             panic!("id is required on a Send Location");
@@ -389,7 +403,7 @@ mod tests {
 
     #[test]
     fn a_frame_no_other_node_hears_is_not_acknowledged() {
-        let alone = CanTransport::new(Arc::new(Medium::<Frame>::new("can0").node()), 0x181);
+        let alone = CanTransport::new(simulated("can0"), 0x181);
         let refused = alone.send("can://can0/0x181", &[1]).expect_err("nobody");
         assert!(refused.retryable, "{refused}");
         assert!(alone.far_end().is_err(), "not a loopback");
@@ -397,7 +411,7 @@ mod tests {
 
     #[test]
     fn a_bus_has_no_artifact_to_claim() {
-        let transport = CanTransport::new(Arc::new(Medium::<Frame>::new("can0").node()), 0x181);
+        let transport = CanTransport::new(simulated("can0"), 0x181);
         assert!(transport.claims().is_none());
         assert_eq!(transport.name(), "can-bus");
     }

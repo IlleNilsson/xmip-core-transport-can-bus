@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sdk::broadcast::Node;
+use sdk::broadcast::{Medium, Node};
 
 use transport::error::Result;
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
@@ -132,7 +132,16 @@ impl Bus for SocketCan {
 pub fn open_bus(address: &str) -> Result<Arc<dyn Bus>> {
     let bus: Arc<dyn Bus> = cfg_select! {
         all(feature = "socketcan", target_os = "linux") => Arc::new(SocketCan::open(address)?),
-        _ => Arc::new(sdk::broadcast::Medium::<Frame>::new(address).node()),
+        _ => simulated(address),
     };
     Ok(bus)
+}
+
+/// A node on the simulated bus called `name`: what [`open_bus`] gives where
+/// the build has no kernel bus, and what a test builds a technology on
+/// wherever it runs, `socketcan` or not — in the estate's one workspace
+/// another crate may turn that feature on (ADR-0016, amendment 2026-11-20).
+#[must_use]
+pub fn simulated(name: &str) -> Arc<dyn Bus> {
+    Arc::new(Medium::<Frame>::new(name).node())
 }
