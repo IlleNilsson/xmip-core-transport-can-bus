@@ -21,35 +21,56 @@
 //! any receiver reads it, and has no reply above that. Each frame arrives
 //! whole. The protocols above that have one — ISO-TP's flow control, a
 //! `CANopen` SDO response — answer it themselves.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 mod bus;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod loopback;
 
+#[cfg(feature = "default")]
 use std::sync::Arc;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
 #[cfg(all(feature = "socketcan", target_os = "linux"))]
 pub use bus::SocketCan;
+#[cfg(feature = "default")]
 pub use bus::{Bus, open_bus, simulated};
+#[cfg(feature = "default")]
 use codec::hex::prefixed_number;
+#[cfg(feature = "default")]
 use context::property::CAN_IDENTIFIER;
+#[cfg(feature = "default")]
+use declaration::RECEIVE_TIMEOUT;
+#[cfg(feature = "default")]
 use net::Target;
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
+#[cfg(feature = "default")]
 use transport::held::Held;
 // The trait shares its name with the bus below; it is reached by path.
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT};
+#[cfg(feature = "default")]
 use transport::{Acknowledgement, Arrived, Configured, Directions, Taken, Transport};
-use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
 /// Why a CAN frame cannot be acknowledged after the receive cycle.
+#[cfg(feature = "default")]
 pub const AT_MOST_ONCE: &str = "a CAN frame is acknowledged on the wire by every controller \
                                 that hears it, before any receiver reads it; there is no \
                                 reply to defer";
 
-/// How long a receive waits for a frame when a Location says nothing else.
-const RECEIVE_TIMEOUT: Duration = Duration::from_secs(1);
-
 /// One classical CAN frame.
+#[cfg(feature = "default")]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     pub id: u32,
@@ -57,6 +78,7 @@ pub struct Frame {
     pub data: Vec<u8>,
 }
 
+#[cfg(feature = "default")]
 impl Frame {
     /// A frame, refusing what CAN cannot carry: more than eight bytes, an
     /// 11-bit identifier over `0x7ff`, a 29-bit one over `0x1fff_ffff`.
@@ -87,6 +109,7 @@ impl Frame {
     }
 }
 
+#[cfg(feature = "default")]
 #[derive(Clone)]
 pub struct CanTransport {
     bus: Arc<dyn Bus>,
@@ -97,6 +120,7 @@ pub struct CanTransport {
     far: Option<Arc<dyn Bus>>,
 }
 
+#[cfg(feature = "default")]
 impl CanTransport {
     /// A transport over `bus`, sending under identifier `id`.
     #[must_use]
@@ -135,6 +159,7 @@ impl CanTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for CanTransport {
     fn name(&self) -> &'static str {
         "can-bus"
@@ -176,32 +201,10 @@ impl Transport for CanTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for CanTransport {
-    /// The address is the bus, as [`open_bus`] opens it.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "id",
-                kind: Kind::Integer {
-                    minimum: 0,
-                    maximum: 0x1fff_ffff,
-                },
-                presence: Presence::Required,
-                meaning: "The identifier a frame is sent under where the target names none; \
-                          one over 0x7ff is extended.",
-                applies: Applies::Send,
-            },
-            transport::configured::timeout(
-                Applies::Receive,
-                Some(RECEIVE_TIMEOUT),
-                "How long a receive waits for a frame before it finds none.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["can"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
         Some(&mut self.receive_timeout)
@@ -212,6 +215,7 @@ impl Configured for CanTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl CanTransport {
     /// The node a Location's settings build on `bus`: the bus its address
     /// names, or a simulated one a test gives it.
@@ -245,6 +249,7 @@ impl CanTransport {
 /// A Stream longer than one frame travels as frames of at most eight bytes
 /// under one identifier, until the bus is quiet. An empty Stream is one
 /// frame with no data: CAN carries it, and the far end sees it arrive.
+#[cfg(feature = "default")]
 impl transport::loopback::Loopback for CanTransport {
     fn arrival_identity(&self) -> transport::ArrivalIdentity {
         transport::ArrivalIdentity::Named(&[context::property::CAN_IDENTIFIER])
@@ -305,6 +310,7 @@ mod tests {
     use super::*;
     use transport::loopback::Loopback as _;
     use transport::payload::edge_payloads;
+    use xcore::settings::Applies;
 
     /// On the simulated bus, by its own constructor, wherever it runs: with
     /// `socketcan` on Linux the address opens a kernel socket, which a unit
